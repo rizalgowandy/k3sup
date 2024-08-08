@@ -3,7 +3,6 @@ package cmd
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -15,12 +14,13 @@ import (
 	"github.com/alexellis/k3sup/pkg"
 	operator "github.com/alexellis/k3sup/pkg/operator"
 
+	"errors"
+
 	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var kubeconfig []byte
@@ -68,7 +68,7 @@ func MakeInstall() *cobra.Command {
     --skip-install
 
   # Install a specific version on local machine without using SSH
-  k3sup install --local --k3s-version v1.19.7
+  k3sup install --local --k3s-version v1.25.1
 
   # Install, passing extra args to K3s
   k3sup install --local --k3s-extra-args="--data-dir /mnt/ssd/k3s"
@@ -111,12 +111,13 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 	command.Flags().String("token", "", "the token used to encrypt the datastore, must be the same token for all nodes")
 
 	command.Flags().String("k3s-version", "", "Set a version to install, overrides k3s-channel")
-	command.Flags().String("k3s-extra-args", "", "Additional arguments to pass to k3s installer, wrapped in quotes (e.g. --k3s-extra-args '--no-deploy servicelb')")
+	command.Flags().String("k3s-extra-args", "", "Additional arguments to pass to k3s installer, wrapped in quotes (e.g. --k3s-extra-args '--disable servicelb')")
 	command.Flags().String("k3s-channel", PinnedK3sChannel, "Release channel: stable, latest, or pinned v1.19")
 
 	command.Flags().String("tls-san", "", "Use an additional IP or hostname for the API server")
 
 	command.PreRunE = func(command *cobra.Command, args []string) error {
+
 		local, err := command.Flags().GetBool("local")
 		if err != nil {
 			return err
@@ -286,62 +287,24 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 			return nil
 		}
 
-		port, _ := command.Flags().GetInt("ssh-port")
-
 		fmt.Println("Public IP: " + host)
 
+		port, _ := command.Flags().GetInt("ssh-port")
 		user, _ := command.Flags().GetString("user")
 		sshKey, _ := command.Flags().GetString("ssh-key")
 
 		sshKeyPath := expandPath(sshKey)
 		address := fmt.Sprintf("%s:%d", host, port)
 
-		var sshOperator *operator.SSHOperator
-		var initialSSHErr error
-		if runtime.GOOS != "windows" {
-
-			var sshAgentAuthMethod ssh.AuthMethod
-			sshAgentAuthMethod, initialSSHErr = sshAgentOnly()
-			if initialSSHErr == nil {
-				// Try SSH agent without parsing key files, will succeed if the user
-				// has already added a key to the SSH Agent, or if using a configured
-				// smartcard
-				config := &ssh.ClientConfig{
-					User:            user,
-					Auth:            []ssh.AuthMethod{sshAgentAuthMethod},
-					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				}
-
-				sshOperator, initialSSHErr = operator.NewSSHOperator(address, config)
-			}
-		} else {
-			initialSSHErr = errors.New("ssh-agent unsupported on windows")
+		sshOperator, sshOperatorDone, errored, err := connectOperator(user, address, sshKeyPath)
+		if errored {
+			return err
 		}
 
-		// If the initial connection attempt fails fall through to the using
-		// the supplied/default private key file
-		if initialSSHErr != nil {
-			publicKeyFileAuth, closeSSHAgent, err := loadPublickey(sshKeyPath)
-			if err != nil {
-				return errors.Wrapf(err, "unable to load the ssh key with path %q", sshKeyPath)
-			}
+		if sshOperatorDone != nil {
 
-			defer closeSSHAgent()
-
-			config := &ssh.ClientConfig{
-				User:            user,
-				Auth:            []ssh.AuthMethod{publicKeyFileAuth},
-				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-			}
-
-			sshOperator, err = operator.NewSSHOperator(address, config)
-
-			if err != nil {
-				return errors.Wrapf(err, "unable to connect to %s over ssh", address)
-			}
+			defer sshOperatorDone()
 		}
-
-		defer sshOperator.Close()
 
 		if !skipInstall {
 
@@ -361,6 +324,7 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 		if printCommand {
 			fmt.Printf("ssh: %s\n", getConfigcommand)
 		}
+
 		if err = obtainKubeconfig(sshOperator, getConfigcommand, host, context, localKubeconfig, merge, printConfig); err != nil {
 			return err
 		}
@@ -369,6 +333,71 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 	}
 
 	return command
+}
+
+type DoneFunc func()
+
+// connectOperator
+//
+// Try SSH agent without parsing key files, will succeed if the user
+// has already added a key to the SSH Agent, or if using a configured
+// smartcard.
+//
+// If the initial connection attempt fails fall through to the using
+// the supplied/default private key file
+// DoneFunc should be called by the caller to close the SSH connection when done
+func connectOperator(user string, address string, sshKeyPath string) (*operator.SSHOperator, DoneFunc, bool, error) {
+	var sshOperator *operator.SSHOperator
+	var initialSSHErr error
+	var closeSSHAgentFunc func() error
+
+	doneFunc := func() {
+		if sshOperator != nil {
+			sshOperator.Close()
+		}
+		if closeSSHAgentFunc != nil {
+			closeSSHAgentFunc()
+		}
+	}
+
+	if runtime.GOOS != "windows" {
+		var sshAgentAuthMethod ssh.AuthMethod
+		sshAgentAuthMethod, initialSSHErr = sshAgentOnly()
+		if initialSSHErr == nil {
+
+			config := &ssh.ClientConfig{
+				User:            user,
+				Auth:            []ssh.AuthMethod{sshAgentAuthMethod},
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			}
+
+			sshOperator, initialSSHErr = operator.NewSSHOperator(address, config)
+		}
+	} else {
+		initialSSHErr = errors.New("ssh-agent unsupported on windows")
+	}
+
+	if initialSSHErr != nil {
+		publicKeyFileAuth, closeSSHAgent, err := loadPublickey(sshKeyPath)
+		if err != nil {
+			return nil, nil, true, fmt.Errorf("unable to load the ssh key with path %q: %w", sshKeyPath, err)
+		}
+
+		defer closeSSHAgent()
+
+		config := &ssh.ClientConfig{
+			User:            user,
+			Auth:            []ssh.AuthMethod{publicKeyFileAuth},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		}
+
+		sshOperator, err = operator.NewSSHOperator(address, config)
+		if err != nil {
+			return nil, nil, true, fmt.Errorf("unable to connect to %s over ssh: %w", address, err)
+		}
+	}
+
+	return sshOperator, doneFunc, false, nil
 }
 
 func sshAgentOnly() (ssh.AuthMethod, error) {
@@ -428,7 +457,7 @@ kubectl get node -o wide
 			pkg.SupportMessageShort)
 	}
 
-	if err := ioutil.WriteFile(absPath, []byte(data), 0600); err != nil {
+	if err := os.WriteFile(absPath, []byte(data), 0600); err != nil {
 		return err
 	}
 
@@ -437,10 +466,18 @@ kubectl get node -o wide
 
 func mergeConfigs(localKubeconfigPath, context string, k3sconfig []byte) ([]byte, error) {
 	// Create a temporary kubeconfig to store the config of the newly create k3s cluster
-	file, err := ioutil.TempFile(os.TempDir(), "k3s-temp-*")
+	file, err := os.CreateTemp(os.TempDir(), "k3s-temp-*")
 	if err != nil {
 		return nil, fmt.Errorf("could not generate a temporary file to store the kubeconfig: %w", err)
 	}
+
+	defer func() {
+		// Remove the temporarily generated file, even if there is an error and the
+		// function returns early
+		if err = os.Remove(file.Name()); err != nil {
+			log.Printf("could not remove temporary kubeconfig file: %s %s", file.Name(), err)
+		}
+	}()
 
 	if err := writeConfig(file.Name(), []byte(k3sconfig), context, true); err != nil {
 		return nil, err
@@ -474,13 +511,6 @@ func mergeConfigs(localKubeconfigPath, context string, k3sconfig []byte) ([]byte
 			file.Name(), err)
 	}
 
-	// Remove the temporarily generated file
-	err = os.Remove(file.Name())
-	if err != nil {
-		return nil, fmt.Errorf("could not remove temporary kubeconfig file: %s %w",
-			file.Name(), err)
-	}
-
 	return data, nil
 }
 
@@ -498,7 +528,7 @@ func sshAgent(publicKeyPath string) (ssh.AuthMethod, func() error) {
 			return nil, sshAgentConn.Close
 		}
 
-		pubkey, err := ioutil.ReadFile(publicKeyPath)
+		pubkey, err := os.ReadFile(publicKeyPath)
 		if err != nil {
 			return nil, sshAgentConn.Close
 		}
@@ -521,7 +551,7 @@ func sshAgent(publicKeyPath string) (ssh.AuthMethod, func() error) {
 func loadPublickey(path string) (ssh.AuthMethod, func() error, error) {
 	noopCloseFunc := func() error { return nil }
 
-	key, err := ioutil.ReadFile(path)
+	key, err := os.ReadFile(path)
 	if err != nil {
 		return nil, noopCloseFunc, fmt.Errorf("unable to read file: %s, %s", path, err)
 	}
@@ -541,7 +571,7 @@ func loadPublickey(path string) (ssh.AuthMethod, func() error, error) {
 
 		fmt.Printf("Enter passphrase for '%s': ", path)
 		STDIN := int(os.Stdin.Fd())
-		bytePassword, _ := terminal.ReadPassword(STDIN)
+		bytePassword, _ := term.ReadPassword(STDIN)
 
 		// Ignore any error from reading stdin to retain existing behaviour for unit test in
 		// install_test.go
@@ -561,6 +591,8 @@ func loadPublickey(path string) (ssh.AuthMethod, func() error, error) {
 	return ssh.PublicKeys(signer), noopCloseFunc, nil
 }
 
+// rewriteKubeconfig replaces the IP address of the server with the IP address
+// it also changes the context from "default" to the value of the --context flag
 func rewriteKubeconfig(kubeconfig string, host string, context string) []byte {
 	if context == "" {
 		context = "default"
@@ -586,8 +618,8 @@ func makeInstallExec(cluster bool, host, tlsSAN string, options k3sExecOptions) 
 	}
 
 	if options.NoExtras {
-		extraArgs = append(extraArgs, "--no-deploy servicelb")
-		extraArgs = append(extraArgs, "--no-deploy traefik")
+		extraArgs = append(extraArgs, "--disable servicelb")
+		extraArgs = append(extraArgs, "--disable traefik")
 	}
 
 	extraArgs = append(extraArgs, options.ExtraArgs)

@@ -9,9 +9,9 @@ The tool is written in Go and is cross-compiled for Linux, Windows, MacOS and ev
 How do you say it? Ketchup, as in tomato.
 
 [![Sponsor this](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&link=https://github.com/sponsors/alexellis)](https://github.com/sponsors/alexellis)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![build](https://github.com/alexellis/k3sup/actions/workflows/build.yaml/badge.svg)](https://github.com/alexellis/k3sup/actions/workflows/build.yaml)
-[![GoDoc](https://godoc.org/github.com/alexellis/k3sup?status.svg)](https://godoc.org/github.com/alexellis/k3sup) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![Downloads](https://img.shields.io/github/downloads/alexellis/k3sup/total)
+[![Github All Releases](https://img.shields.io/github/downloads/alexellis/k3sup/total.svg)]()
 
 ## Contents:
 - [k3sup 🚀 (said 'ketchup')](#k3sup--said-ketchup)
@@ -30,6 +30,7 @@ How do you say it? Ketchup, as in tomato.
     - [Merging clusters into your KUBECONFIG](#merging-clusters-into-your-kubeconfig)
     - [😸 Join some agents to your Kubernetes server](#-join-some-agents-to-your-kubernetes-server)
     - [Use your hardware authentication / 2FA or SSH Agent](#use-your-hardware-authentication--2fa-or-ssh-agent)
+    - [K3sup plan for automation](#k3sup-plan-for-automation)
     - [Create a multi-master (HA) setup with external SQL](#create-a-multi-master-ha-setup-with-external-sql)
     - [Create a multi-master (HA) setup with embedded etcd](#create-a-multi-master-ha-setup-with-embedded-etcd)
     - [👨‍💻 Micro-tutorial for Raspberry Pi (2, 3, or 4) 🥧](#-micro-tutorial-for-raspberry-pi-2-3-or-4-)
@@ -56,19 +57,15 @@ You may wonder why a tool like this needs to exist when you can do this sort of 
 
 k3sup was developed to automate what can be a very manual and confusing process for many developers, who are already short on time. Once you've provisioned a VM with your favourite tooling, `k3sup` means you are only 60 seconds away from running `kubectl get pods` on your own computer. If you are a local computer, you can bypass SSH with `k3sup install --local`
 
-## Do you love `k3sup`?
+## Do you use `k3sup`?
+
+`k3sup` was created by [Alex Ellis](https://github.com/users/alexellis/sponsorship) - the founder of [OpenFaaS &reg;](https://www.openfaas.com/) & [inlets](https://inlets.dev/). 
 
 <a href="https://github.com/sponsors/alexellis/">
 <img alt="Sponsor this project" src="https://github.com/alexellis/alexellis/blob/master/sponsor-today.png" width="90%">
 </a>
 
-`k3sup` was created by [Alex Ellis](https://github.com/users/alexellis/sponsorship) - the founder of [OpenFaaS &reg;](https://www.openfaas.com/) & [inlets](https://inlets.dev/). Alex is also an active part of the Docker & Kubernetes community as a [CNCF Ambassador](https://www.cncf.io/people/ambassadors/).
-
-If you've benefitted from his open source projects or blog posts in some way, then and join dozens of other developers sponsoring him today.
-
-A monthly sponsorship is required to receive any form of support such as Issues or Pull Requests.
-
-[Sponsor alexellis on GitHub](https://github.com/users/alexellis/sponsorship)
+Want to see continued development? [Sponsor alexellis on GitHub](https://github.com/users/alexellis/sponsorship)
 
 ### Uses
 
@@ -115,7 +112,7 @@ The `k3sup` tool is a client application which you can run on your own computer.
 
 ## Pre-requisites for k3sup servers and agents
 
-Some Linux hosts are configured to allow `sudo` to run without having to repeat your password. For those which are not already configured that way, you'll nee to make the following changes if you wish to use `k3sup`:
+Some Linux hosts are configured to allow `sudo` to run without having to repeat your password. For those which are not already configured that way, you'll need to make the following changes if you wish to use `k3sup`:
 
 ```bash
 # sudo visudo
@@ -161,7 +158,8 @@ Other options for `install`:
 * `--merge` - Merge config into existing file instead of overwriting (e.g. to add config to the default kubectl config, use `--local-path ~/.kube/config --merge`).
 * `--context` - default is `default` - set the name of the kubeconfig context.
 * `--ssh-port` - default is `22`, but you can specify an alternative port i.e. `2222`
-* `--k3s-extra-args` - Optional extra arguments to pass to k3s installer, wrapped in quotes, i.e. `--k3s-extra-args '--no-deploy traefik'` or `--k3s-extra-args '--docker'`. For multiple args combine then within single quotes `--k3s-extra-args '--no-deploy traefik --docker'`.
+* `--no-extras` - disable "servicelb" and "traefik"
+* `--k3s-extra-args` - Optional extra arguments to pass to k3s installer, wrapped in quotes, i.e. `--k3s-extra-args '--disable traefik'` or `--k3s-extra-args '--docker'`. For multiple args combine then within single quotes `--k3s-extra-args '--disable traefik --docker'`.
 * `--k3s-version` - set the specific version of k3s, i.e. `v1.21.1`
 * `--k3s-channel` - set a specific version of k3s based upon a channel i.e. `stable`
 - `--ipsec` - Enforces the optional extra argument for k3s: `--flannel-backend` option: `ipsec`
@@ -190,10 +188,10 @@ Install K3s directly on the node and then check if it's ready:
 ```bash
 k3sup install \
   --local \
-  --context localk3
+  --context localk3s
 
 k3sup ready \
-  --context localk3 \
+  --context localk3s \
   --kubeconfig ./kubeconfig
 ```
 
@@ -287,6 +285,61 @@ Optionally, if your key is encrypted, run: `ssh-add ~/.ssh/id_rsa`
 Now run any `k3sup` command, and your SSH key will be requested from the ssh-agent instead of from the usual location.
 
 You can also specify an SSH key with `--ssh-key` if you want to use a specific key-pair.
+
+### K3sup plan for automation
+
+A new command was added to k3sup to help with automating large amounts of nodes.
+
+`k3sup plan` reads a JSON input file containing hosts, and will generate an installation command for a number of servers and agents.
+
+Example input file:
+
+```json
+[
+  {
+    "hostname": "node-a-1",
+    "ip": "192.168.129.138"
+  },
+  {
+    "hostname": "node-a-2",
+    "ip": "192.168.129.128"
+  },
+  {
+    "hostname": "node-a-3",
+    "ip": "192.168.129.131"
+  },
+  {
+    "hostname": "node-a-4",
+    "ip": "192.168.129.130"
+  },
+  {
+    "hostname": "node-a-5",
+    "ip": "192.168.129.127"
+  }
+]
+```
+
+The following will create 1x primary server, with 2x additional servers within a HA etcd cluster, the last two nodes will be added as agents:
+
+```bash
+k3sup plan \
+  devices.json \
+  --user ubuntu \
+  --servers 3 \
+  --server-k3s-extra-args "--disable traefik" \
+  --background > bootstrap.sh
+```
+
+Then make the file executable and run it:
+
+```bash
+chmod +x bootstrap.sh
+./bootstrap.sh
+```
+
+Watch a demo with dozens of Firecracker VMs: [Testing Kubernetes at Scale with bare-metal](https://youtu.be/o4UxRw-Cc8c)
+
+The initial version of `k3sup plan` has a reduced set of flags. Flags such as `--k3s-version` and `--datastore` are not available, but feel free to propose an issue with what you need.
 
 ### Create a multi-master (HA) setup with external SQL
 
@@ -483,6 +536,23 @@ kubectl get node
 NAME              STATUS   ROLES    AGE     VERSION
 paprika-gregory   Ready    master   8m27s   v1.19.2-k3s
 cave-sensor       Ready    master   27m     v1.19.2-k3s
+```
+
+If you used `--no-extras` on the initial installation you will also need to provide it on each join:
+
+```sh
+export USER=root
+export SERVER_IP=192.168.0.100
+export NEXT_SERVER_IP=192.168.0.101
+
+k3sup join \
+  --ip $NEXT_SERVER_IP \
+  --user $USER \
+  --server-user $USER \
+  --server-ip $SERVER_IP \
+  --server \
+  --no-extras \
+  --k3s-version v1.19.1+k3s1
 ```
 
 ### 👨‍💻 Micro-tutorial for Raspberry Pi (2, 3, or 4) 🥧
@@ -701,13 +771,7 @@ The most common problem is that you missed a step, fortunately it's relatively e
   - You are using different usernames for SSH'ing to the server and the node to be added. In that case, playe provide the username for the server via the `--server-user` parameter.
 * Your `.ssh/config` file isn't being used by K3sup. K3sup does not use the config file used by the `ssh` command-line, but instead uses CLI flags, run `k3sup install/join --help` to learn which are supported.
 
-### Support and k3sup for commercial use
-
-* K3sup doesn't use a declarative YAML file to setup all my hosts. This is by design, feel free to write a very short bash script instead, it will be equivalent, since `k3sup install/join` can be run multiple times without side-effects. 
-* You want to setup a cluster using an SSH bastion host. This is a premium feature and requires a license.
-* You want to install K3s into an airgapped environment. This is a premium feature and requires a license.
-
-Finally, if you need any form of technical support, you must [first become a GitHub Sponsor](https://github.com/sponsors/alexellis) before raising an issue. All changes to K3sup must be proposed in an issue before a PR is sent, PRs without approved issues will be closed without comment.
+> Note: Passing `--no-deploy` to `--k3s-extra-args` was deprecated by the K3s installer in K3s 1.17. Use `--disable` instead or `--no-extras`.
 
 ### Getting access to your KUBECONFIG
 
