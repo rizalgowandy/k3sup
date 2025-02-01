@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
@@ -48,7 +47,7 @@ kfFJfrUjElq6Bx9oPPxc2vD40gqnYL57A+Y+X+A0kL4fO7pfh2VxOw==
 func Test_loadPublickeyEncrypted(t *testing.T) {
 	want := &ssh.PassphraseMissingError{}
 
-	tmpfile, err := ioutil.TempFile("", "key")
+	tmpfile, err := os.CreateTemp("", "key")
 	if err != nil {
 		t.Error(err)
 	}
@@ -255,7 +254,7 @@ func Test_makeInstallExec_Datastore_NoExtras(t *testing.T) {
 			NoExtras:     k3sNoExtras,
 			ExtraArgs:    k3sExtraArgs,
 		})
-	want := "INSTALL_K3S_EXEC='server --tls-san 192.168.0.1 --datastore-endpoint mysql://doadmin:show-password@tcp(db-mysql-lon1-40939-do-user-2197152-0.b.db.ondigitalocean.com:25060)/defaultdb --token this-token --no-deploy servicelb --no-deploy traefik'"
+	want := "INSTALL_K3S_EXEC='server --tls-san 192.168.0.1 --datastore-endpoint mysql://doadmin:show-password@tcp(db-mysql-lon1-40939-do-user-2197152-0.b.db.ondigitalocean.com:25060)/defaultdb --token this-token --disable servicelb --disable traefik'"
 	if got != want {
 		t.Errorf("want: %q, got: %q", want, got)
 	}

@@ -188,7 +188,7 @@ getPackage() {
 thanks() {
     echo
     echo "================================================================"
-    echo "  alexellis's work on k3sup needs your support"
+    echo "  Support Alex's work on K3sup via GitHub Sponsors"
     echo "" 
     echo "  https://github.com/sponsors/alexellis" 
     echo "================================================================"

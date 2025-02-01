@@ -3,13 +3,15 @@ package cmd
 import (
 	"fmt"
 	"net"
+	"os"
 	"path"
 	"runtime"
 	"strings"
 
+	"errors"
+
 	"github.com/alexellis/k3sup/pkg"
 	operator "github.com/alexellis/k3sup/pkg/operator"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 )
@@ -63,11 +65,16 @@ func MakeJoin() *cobra.Command {
 	command.Flags().Bool("sudo", true, "Use sudo for installation. e.g. set to false when using the root user and no sudo is available.")
 
 	command.Flags().Bool("server", false, "Join the cluster as a server rather than as an agent for the embedded etcd mode")
+	command.Flags().Bool("no-extras", false, `Disable "servicelb" and "traefik", when using --server flag`)
 	command.Flags().Bool("print-command", false, "Print a command that you can use with SSH to manually recover from an error")
+	command.Flags().String("node-token-path", "", "file containing --node-token")
+	command.Flags().String("node-token", "", "prefetched token used by nodes to join the cluster")
 
 	command.Flags().String("k3s-extra-args", "", "Additional arguments to pass to k3s installer, wrapped in quotes (e.g. --k3s-extra-args '--node-taint key=value:NoExecute')")
 	command.Flags().String("k3s-version", "", "Set a version to install, overrides k3s-channel")
 	command.Flags().String("k3s-channel", PinnedK3sChannel, "Release channel: stable, latest, or i.e. v1.19")
+
+	command.Flags().String("tls-san", "", "Use an additional IP or hostname for the API server, when using --server flag")
 
 	command.Flags().String("server-data-dir", "/var/lib/rancher/k3s/", "Override the path used to fetch the node-token from the server")
 
@@ -77,6 +84,22 @@ func MakeJoin() *cobra.Command {
 		ip, err := command.Flags().GetIP("ip")
 		if err != nil {
 			return err
+		}
+
+		var nodeToken string
+
+		if command.Flags().Changed("node-token") {
+			nodeToken, _ = command.Flags().GetString("node-token")
+		} else if command.Flags().Changed("node-token-path") {
+			nodeTokenPath, _ := command.Flags().GetString("node-token-path")
+			if len(nodeTokenPath) > 0 {
+				data, err := os.ReadFile(nodeTokenPath)
+				if err != nil {
+					return err
+				}
+
+				nodeToken = strings.TrimSpace(string(data))
+			}
 		}
 
 		host, err := command.Flags().GetString("host")
@@ -91,6 +114,7 @@ func MakeJoin() *cobra.Command {
 		if err != nil {
 			return err
 		}
+
 		if len(dataDir) == 0 {
 			return fmt.Errorf("--server-data-dir must be set")
 		}
@@ -117,9 +141,9 @@ func MakeJoin() *cobra.Command {
 			return err
 		}
 
-		fmt.Println("Server IP: " + serverHost)
+		fmt.Printf("Joining %s => %s\n", host, serverHost)
 		if len(serverURL) > 0 {
-			fmt.Println("Server URL: " + serverURL)
+			fmt.Printf("Server join URL: %s\n", serverURL)
 		}
 
 		user, _ := command.Flags().GetString("user")
@@ -171,96 +195,62 @@ func MakeJoin() *cobra.Command {
 		if useSudo {
 			sudoPrefix = "sudo "
 		}
-
 		sshKeyPath := expandPath(sshKey)
-		address := fmt.Sprintf("%s:%d", serverHost, serverPort)
 
-		var sshOperator *operator.SSHOperator
-		var initialSSHErr error
-		if runtime.GOOS != "windows" {
+		if len(nodeToken) == 0 {
+			address := fmt.Sprintf("%s:%d", serverHost, serverPort)
 
-			var sshAgentAuthMethod ssh.AuthMethod
-			sshAgentAuthMethod, initialSSHErr = sshAgentOnly()
-			if initialSSHErr == nil {
-				// Try SSH agent without parsing key files, will succeed if the user
-				// has already added a key to the SSH Agent, or if using a configured
-				// smartcard
-				config := &ssh.ClientConfig{
-					User:            serverUser,
-					Auth:            []ssh.AuthMethod{sshAgentAuthMethod},
-					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				}
-
-				sshOperator, initialSSHErr = operator.NewSSHOperator(address, config)
-			}
-		} else {
-			initialSSHErr = errors.New("ssh-agent unsupported on windows")
-		}
-
-		// If the initial connection attempt fails fall through to the using
-		// the supplied/default private key file
-		var publicKeyFileAuth ssh.AuthMethod
-		var closeSSHAgent func() error
-		if initialSSHErr != nil {
-			var err error
-			publicKeyFileAuth, closeSSHAgent, err = loadPublickey(sshKeyPath)
-			if err != nil {
-				return errors.Wrapf(err, "unable to load the ssh key with path %q", sshKeyPath)
+			sshOperator, sshOperatorDone, errored, err := connectOperator(serverUser, address, sshKeyPath)
+			if errored {
+				return err
 			}
 
-			defer closeSSHAgent()
-
-			config := &ssh.ClientConfig{
-				User: serverUser,
-				Auth: []ssh.AuthMethod{
-					publicKeyFileAuth,
-				},
-				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			if sshOperatorDone != nil {
+				defer sshOperatorDone()
 			}
 
-			sshOperator, err = operator.NewSSHOperator(address, config)
+			getTokenCommand := fmt.Sprintf("%scat %s\n", sudoPrefix, path.Join(dataDir, "/server/node-token"))
+			if printCommand {
+				fmt.Printf("ssh: %s\n", getTokenCommand)
+			}
+
+			streamToStdio := false
+			res, err := sshOperator.ExecuteStdio(getTokenCommand, streamToStdio)
 
 			if err != nil {
-				return errors.Wrapf(err, "unable to connect to (server) %s over ssh", address)
+				return fmt.Errorf("unable to get join-token from server: %w", err)
 			}
+
+			if len(res.StdErr) > 0 {
+				fmt.Printf("Error or warning getting node-token: %s\n", res.StdErr)
+			} else {
+				fmt.Printf("Received node-token from %s.. ok.\n", serverHost)
+			}
+
+			// Explicit close of the SSH connection as early as possible
+			// which complements the defer
+			if sshOperatorDone != nil {
+				sshOperatorDone()
+			}
+
+			nodeToken = strings.TrimSpace(string(res.StdOut))
 		}
 
-		defer sshOperator.Close()
-
-		getTokenCommand := fmt.Sprintf("%scat %s\n", sudoPrefix, path.Join(dataDir, "/server/node-token"))
-		if printCommand {
-			fmt.Printf("ssh: %s\n", getTokenCommand)
-		}
-
-		res, err := sshOperator.Execute(getTokenCommand)
-
-		if err != nil {
-			return errors.Wrap(err, "unable to get join-token from server")
-		}
-
-		if len(res.StdErr) > 0 {
-			fmt.Printf("Logs: %s", res.StdErr)
-		}
-
-		if closeSSHAgent != nil {
-			closeSSHAgent()
-		}
-		sshOperator.Close()
-
-		joinToken := string(res.StdOut)
-
-		var boostrapErr error
 		if server {
-			boostrapErr = setupAdditionalServer(serverHost, host, port, user, sshKeyPath, joinToken, k3sExtraArgs, k3sVersion, k3sChannel, printCommand, serverURL)
+
+			tlsSan, _ := command.Flags().GetString("tls-san")
+			noExtras, _ := command.Flags().GetBool("no-extras")
+
+			err = setupAdditionalServer(serverHost, host, port, user, sshKeyPath, nodeToken, k3sExtraArgs, k3sVersion, k3sChannel, tlsSan, printCommand, serverURL, noExtras)
 		} else {
-			boostrapErr = setupAgent(serverHost, host, port, user, sshKeyPath, joinToken, k3sExtraArgs, k3sVersion, k3sChannel, printCommand, serverURL)
+			err = setupAgent(serverHost, host, port, user, sshKeyPath, nodeToken, k3sExtraArgs, k3sVersion, k3sChannel, printCommand, serverURL)
 		}
 
-		if boostrapErr == nil {
+		if err == nil {
 			fmt.Printf("\n%s\n", pkg.SupportMessageShort)
 		}
 
-		return boostrapErr
+		return err
 	}
 
 	command.PreRunE = func(command *cobra.Command, args []string) error {
@@ -290,13 +280,38 @@ func MakeJoin() *cobra.Command {
 			return err
 		}
 
+		tlsSan, err := command.Flags().GetString("tls-san")
+		if err != nil {
+			return err
+		}
+
+		noExtras, err := command.Flags().GetBool("no-extras")
+		if err != nil {
+			return err
+		}
+
+		if len(tlsSan) > 0 || noExtras {
+			server, err := command.Flags().GetBool("server")
+			if err != nil {
+				return err
+			}
+
+			if !server {
+				if noExtras {
+					return fmt.Errorf("--no-extras can only be used with --server")
+				}
+				return fmt.Errorf("--tls-san can only be used with --server")
+			}
+
+		}
+
 		return nil
 	}
 
 	return command
 }
 
-func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, joinToken, k3sExtraArgs, k3sVersion, k3sChannel string, printCommand bool, serverURL string) error {
+func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, joinToken, k3sExtraArgs, k3sVersion, k3sChannel, tlsSAN string, printCommand bool, serverURL string, noExtras bool) error {
 	address := fmt.Sprintf("%s:%d", host, port)
 
 	var sshOperator *operator.SSHOperator
@@ -326,7 +341,7 @@ func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, 
 	if initialSSHErr != nil {
 		publicKeyFileAuth, closeSSHAgent, err := loadPublickey(sshKeyPath)
 		if err != nil {
-			return errors.Wrapf(err, "unable to load the ssh key with path %q", sshKeyPath)
+			return fmt.Errorf("unable to load the ssh key with path %q: %w", sshKeyPath, err)
 		}
 
 		defer closeSSHAgent()
@@ -342,7 +357,7 @@ func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, 
 		sshOperator, err = operator.NewSSHOperator(address, config)
 
 		if err != nil {
-			return errors.Wrapf(err, "unable to connect to %s over ssh as %s", address, user)
+			return fmt.Errorf("unable to connect to %s over ssh as %s: %w", address, user, err)
 		}
 	}
 
@@ -351,6 +366,11 @@ func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, 
 
 	defer sshOperator.Close()
 
+	if noExtras {
+		k3sExtraArgs += " --disable servicelb"
+		k3sExtraArgs += " --disable traefik"
+	}
+
 	installk3sExec := makeJoinExec(
 		serverHost,
 		strings.TrimSpace(joinToken),
@@ -358,6 +378,7 @@ func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, 
 		k3sExtraArgs,
 		serverAgent,
 		serverURL,
+		tlsSAN,
 	)
 
 	installAgentServerCommand := fmt.Sprintf("%s | %s", getScript, installk3sExec)
@@ -368,7 +389,7 @@ func setupAdditionalServer(serverHost, host string, port int, user, sshKeyPath, 
 
 	res, err := sshOperator.Execute(installAgentServerCommand)
 	if err != nil {
-		return errors.Wrap(err, "unable to setup agent")
+		return fmt.Errorf("unable to setup agent: %w", err)
 	}
 
 	if len(res.StdErr) > 0 {
@@ -412,7 +433,7 @@ func setupAgent(serverHost, host string, port int, user, sshKeyPath, joinToken, 
 	if initialSSHErr != nil {
 		publicKeyFileAuth, closeSSHAgent, err := loadPublickey(sshKeyPath)
 		if err != nil {
-			return errors.Wrapf(err, "unable to load the ssh key with path %q", sshKeyPath)
+			return fmt.Errorf("unable to load the ssh key with path %q: %w", sshKeyPath, err)
 		}
 
 		defer closeSSHAgent()
@@ -426,9 +447,8 @@ func setupAgent(serverHost, host string, port int, user, sshKeyPath, joinToken, 
 		}
 
 		sshOperator, err = operator.NewSSHOperator(address, config)
-
 		if err != nil {
-			return errors.Wrapf(err, "unable to connect to %s over ssh", address)
+			return fmt.Errorf("unable to connect to %s over ssh: %w", address, err)
 		}
 	}
 
@@ -438,6 +458,8 @@ func setupAgent(serverHost, host string, port int, user, sshKeyPath, joinToken, 
 
 	serverAgent := false
 
+	// Agents don't expose an API server so don't need a TLS SAN
+	tlsSAN := ""
 	installK3sExec := makeJoinExec(
 		serverHost,
 		strings.TrimSpace(joinToken),
@@ -445,6 +467,7 @@ func setupAgent(serverHost, host string, port int, user, sshKeyPath, joinToken, 
 		k3sExtraArgs,
 		serverAgent,
 		serverURL,
+		tlsSAN,
 	)
 
 	installAgentCommand := fmt.Sprintf("%s | %s", getScript, installK3sExec)
@@ -456,7 +479,7 @@ func setupAgent(serverHost, host string, port int, user, sshKeyPath, joinToken, 
 	res, err := sshOperator.Execute(installAgentCommand)
 
 	if err != nil {
-		return errors.Wrap(err, "unable to setup agent")
+		return fmt.Errorf("unable to setup agent: %w", err)
 	}
 
 	if len(res.StdErr) > 0 {
@@ -479,26 +502,33 @@ func createVersionStr(k3sVersion, k3sChannel string) string {
 	return installStr
 }
 
-func makeJoinExec(serverIP, joinToken, installStr, k3sExtraArgs string, serverAgent bool, serverURL string) string {
+func makeJoinExec(serverIP, joinToken, installStr, k3sExtraArgs string, serverAgent bool, serverURL, tlsSan string) string {
 
 	installEnvVar := []string{}
 	remoteURL := fmt.Sprintf("https://%s:6443", serverIP)
 	if len(serverURL) > 0 {
 		remoteURL = serverURL
 	}
+
 	installEnvVar = append(installEnvVar, fmt.Sprintf("K3S_URL='%s'", remoteURL))
 	installEnvVar = append(installEnvVar, fmt.Sprintf("K3S_TOKEN='%s'", joinToken))
 	installEnvVar = append(installEnvVar, installStr)
 
 	if serverAgent {
-		installEnvVar = append(installEnvVar, fmt.Sprintf("INSTALL_K3S_EXEC='server --server %s'", remoteURL))
+		tlsSANValue := ""
+		if len(tlsSan) > 0 {
+			tlsSANValue = fmt.Sprintf(" --tls-san %s", tlsSan)
+		}
+		installEnvVar = append(installEnvVar, fmt.Sprintf("INSTALL_K3S_EXEC='server --server %s%s'", remoteURL, tlsSANValue))
 	}
 
 	joinExec := strings.Join(installEnvVar, " ")
 	joinExec += " sh -s -"
 
 	if len(k3sExtraArgs) > 0 {
-		installEnvVar = append(installEnvVar, k3sExtraArgs)
+		// AE: this doesn't seem to be used
+		// installEnvVar = append(installEnvVar, k3sExtraArgs)
+
 		joinExec += fmt.Sprintf(" %s", k3sExtraArgs)
 	}
 
